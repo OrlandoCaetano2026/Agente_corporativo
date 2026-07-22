@@ -1,0 +1,23 @@
+# Ambientes
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+
+# Variáveis de ambiente / segredos
+.env
+*.key
+
+# Índices vetoriais gerados
+*.faiss
+*.pkl
+chroma_db/
+index/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Sistema
+.DS_Store
+Thumbs.db

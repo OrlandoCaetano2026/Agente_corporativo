@@ -1,0 +1,26 @@
+# Núcleo RAG
+langchain
+langchain-community
+langchain-google-genai
+
+# Leitura de documentos multi-formato
+pypdf
+python-docx
+openpyxl
+python-pptx
+unstructured
+pandas
+beautifulsoup4
+markdown
+
+# Vetorização / embeddings
+faiss-cpu
+chromadb
+sentence-transformers
+
+# Interface
+streamlit
+
+# Utilidades
+python-dotenv
+tiktoken
