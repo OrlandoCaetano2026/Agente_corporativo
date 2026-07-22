@@ -8,19 +8,24 @@
 
 ## 📌 Descrição
 
-Agente de inteligência artificial corporativo, acessível a todos os colaboradores,
-capaz de responder perguntas com base em documentos internos da empresa fictícia
-**Orla_Tech Consultoria**. O contexto é o **suporte a sistemas SAP na indústria**:
+Agente de inteligência artificial corporativo — um **especialista SAP virtual** —
+acessível a todos os colaboradores, que responde perguntas com base em documentos
+internos da empresa fictícia **Orla_Tech Consultoria**. O contexto é o **suporte a
+sistemas SAP na indústria**:
 
 - **Foco principal:** SAP **MM** (Materials Management)
 - **Módulos secundários:** PP, QM e WM
 - **Sistemas:** SAP **ECC** e **S/4HANA**
 - **Integrações MES:** Opcenter (Siemens) e PAS-X (Werum)
 
-Quando o agente **não encontra** a resposta na base, ele informa educadamente que
-não sabe, explica que é necessária validação humana e **pergunta se o usuário deseja
-abrir um chamado**. Após a confirmação, cria um chamado com número sequencial único
-na ferramenta fictícia **ServiceToday** (inspirada no ServiceNow).
+Quando o agente **não encontra** a resposta na base, ele **não inventa**: contorna de
+forma cordial, recomenda consultar o portal da companhia e **oferece registrar um
+chamado** no **ServiceToday** (fictício, inspirado no ServiceNow). Ao abrir o chamado:
+
+- Pergunta a **ferramenta** de destino (**SAP** ou **MES**);
+- **Detecta automaticamente o módulo** (MM/PP/QM/WM/MES) pelo texto do problema;
+- Pergunta a **prioridade** (P1-Crítico, P2-Urgente, P3-Médio, P4-Leve);
+- Gera um **número sequencial único** e registra na base.
 
 ---
 
@@ -41,9 +46,13 @@ Documentos (PDF, XLSX, DOCX, Imagem)
         ▼
 [Passo 6] rag_engine.py       ── geração da resposta (LLM Groq / Llama 3.3)
         │
-        ├── achou resposta? ──► responde com a solução + fontes
+        ├── achou resposta? ──► responde com solução + fontes
         │
-        └── não achou? ──► pede confirmação ──► ticket_service.py (cria chamado)
+        └── não achou? ──► contorno cordial ──► oferta de chamado
+                                  │
+                                  ▼
+                        ticket_service.py (ferramenta SAP/MES,
+                        módulo automático, prioridade P1-P4, ID único)
         │
         ▼
 [Passo 7] app/main.py         ── interface conversacional (Streamlit)
@@ -57,117 +66,90 @@ Documentos (PDF, XLSX, DOCX, Imagem)
 ```
 Agente_corporativo/
 ├── app/
-│   └── main.py                     # Interface conversacional (Streamlit)
-├── src/
-│   ├── document_loader.py          # Passo 3 — extração multi-formato
-│   ├── rag_engine.py               # Passos 4-6 — indexação, recuperação, geração
-│   ├── ticket_service.py           # Criação de chamados (número sequencial único)
-│   └── api.py                      # API REST (FastAPI) para o OCI
-├── data/documentos/                # Base de conhecimento (4 formatos)
+│   └── main.py                       # Interface conversacional (Streamlit)
+├── assets/
+│   └── orlatech_fluxo_suporte.png    # Imagem do fluxo (para o README)
+├── data/documentos/                  # Base de conhecimento (4 formatos)
 │   ├── Base_Conhecimento_FAQ_SAP.pdf
 │   ├── Chamados_Incidentes_Abertos.xlsx
 │   ├── Manual_Procedimentos_Suporte_SAP.docx
 │   └── orlatech_fluxo_suporte.png
 ├── notebooks/
-│   ├── 00_setup_repositorio.ipynb  # Versionamento no Colab
-│   └── 01_executar_agente_rag.ipynb# Executar o RAG passo a passo
-├── assets/                         # Imagens/vídeos para o README
-├── requirements.txt
-├── DEPLOY_OCI.md                   # Guia de deploy no OCI (sem Docker)
+│   └── 01_setup_repositorio.ipynb    # Setup do repo + execução do RAG (Groq)
+├── src/
+│   ├── api.py                        # API REST (FastAPI) para o OCI
+│   ├── document_loader.py            # Passo 3 — extração multi-formato
+│   ├── rag_engine.py                 # Passos 4-6 — indexação, recuperação, geração
+│   └── ticket_service.py             # Chamados: ferramenta, módulo auto, P1-P4, ID único
 ├── .gitignore
-└── README.md
+├── DEPLOY_OCI.md                     # Guia de deploy no OCI (sem Docker)
+├── README.md
+└── requirements.txt
 ```
 
 ## 🛠️ Tecnologias
 
-- **Python 3.10+**
-- **LangChain** — orquestração do pipeline RAG
-- **FAISS** — índice vetorial
-- **Sentence-Transformers** — embeddings (all-MiniLM-L6-v2)
+- **Python 3.10+**, **LangChain**, **FAISS**, **Sentence-Transformers** (all-MiniLM-L6-v2)
 - **Groq (Llama 3.3 70B)** — LLM de geração (rápida e gratuita, plugável)
-- **Streamlit** — interface conversacional
-- **FastAPI** — API REST
+- **Streamlit** (interface), **FastAPI** (API REST)
 - **Oracle Cloud Infrastructure (OCI)** — deploy em nuvem
 
 ---
 
 ## ▶️ Como executar
 
-### Opção A — Google Colab (recomendado, sem instalar nada)
-
-Abra o notebook `notebooks/01_executar_agente_rag.ipynb` no Colab e execute as células
-em ordem. Ele clona o repo, instala dependências e roda o agente passo a passo.
+### Opção A — Google Colab (recomendado)
+Abra `notebooks/01_setup_repositorio.ipynb` e execute as células em ordem
+(atualiza o repositório e roda o agente com Groq).
 
 ### Opção B — Local
-
 ```bash
-# 1. Clonar
 git clone https://github.com/OrlandoCaetano2026/Agente_corporativo.git
 cd Agente_corporativo
-
-# 2. Ambiente virtual + dependências
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-# 3. Configurar a chave da LLM
-export GROQ_API_KEY="sua-chave"   # Windows: set GROQ_API_KEY=...
-
-# 4. Rodar a interface
+export GROQ_API_KEY="sua-chave"
 streamlit run app/main.py
 ```
 
 ### Opção C — Nuvem OCI
-
-Siga o guia detalhado em **[DEPLOY_OCI.md](DEPLOY_OCI.md)**.
+Siga o guia **[DEPLOY_OCI.md](DEPLOY_OCI.md)** (sem Docker).
 
 ---
 
 ## ✅ O que o agente responde
-
 - Dúvidas de **SAP MM** (compras, estoque, faturas, mestre de materiais).
 - Orientações gerais de **PP, QM e WM**.
-- Questões de **integração com MES** (Opcenter, PAS-X).
-- Diferenças entre **ECC e S/4HANA**.
-- Procedimentos e boas práticas presentes na base de conhecimento.
+- Integração com **MES** (Opcenter, PAS-X).
+- Diferenças entre **ECC e S/4HANA** e boas práticas da base.
 
 ## ❌ O que o agente NÃO responde
-
-- Assuntos fora de SAP/MES (ex.: RH, folha de pagamento, infraestrutura de rede).
-- Solicitações de alteração de dados em produção.
-- Concessão de acessos e autorizações.
+- Assuntos fora de SAP/MES (RH, folha, infraestrutura de rede).
+- Alteração de dados em produção; concessão de acessos (Basis).
 - Informações confidenciais / dados pessoais (LGPD).
 
-> Nesses casos, o agente **não inventa**: informa a limitação e, com a confirmação
-> do usuário, abre um chamado no ServiceToday.
+> Nesses casos, contorna cordialmente, recomenda o portal e oferece registrar um chamado.
+
+---
+
+## ⚙️ Onde ajustar o comportamento (RAG)
+No arquivo **`src/rag_engine.py`**:
+- **PROMPT** (persona, tom, formato): método `_montar_prompt()`
+- **LIMIAR_SIMILARIDADE** (quando "não sabe"): topo do arquivo (padrão **0.50**)
+- **TOP_K** (nº de trechos): topo do arquivo (padrão **4**)
+- **Modelo Groq**: variável de ambiente `GROQ_MODEL`
 
 ---
 
 ## ☁️ Deploy em nuvem (OCI)
 
-O agente foi publicado em uma **VM OCI Compute (Always Free)**, atendendo ao requisito
-de uso de ao menos um serviço OCI.
+Publicado em uma **VM OCI Compute (Always Free)**, atendendo ao requisito de uso de
+ao menos um serviço OCI.
 
 <!-- Substitua pela imagem/vídeo do agente rodando na nuvem (Passo 9) -->
 ![Agente rodando na nuvem OCI](assets/demo_oci.png)
 
-*(Print do agente em execução, com o IP público do OCI visível na barra de endereço.)*
-
----
-
-## 🔧 Instruções para modificações
-
-- **Adicionar documentos:** coloque novos arquivos em `data/documentos/` e reindexe
-  (o `document_loader` já suporta PDF, DOCX, XLSX e imagens; extensível a CSV/JSON/HTML).
-- **Trocar a LLM:** ajuste o método `_get_llm()` em `src/rag_engine.py` (hoje usa Groq;
-  o modelo pode ser trocado pela variável `GROQ_MODEL`).
-- **Ajustar sensibilidade:** mude a variável `RAG_LIMIAR` (limiar de similaridade)
-  ou `RAG_TOP_K` (nº de trechos recuperados).
-- **Migrar a base de chamados para banco:** substitua a leitura/escrita do Excel em
-  `src/ticket_service.py` por um banco (ex.: Oracle Autonomous Database no OCI).
-
 ---
 
 ## 👤 Autor
-
 **Orlando dos Santos Caetano** — Tech Challenge Alura + Oracle.
