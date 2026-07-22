@@ -5,18 +5,19 @@ env/
 __pycache__/
 *.pyc
 
-# Variáveis de ambiente / segredos
+# Segredos
 .env
 *.key
 
-# Índices vetoriais gerados
+# Índices vetoriais
 *.faiss
 *.pkl
-chroma_db/
 index/
 
-# Notebooks checkpoints
+# Colab / logs
 .ipynb_checkpoints/
+nohup.out
+log.txt
 
 # Sistema
 .DS_Store
