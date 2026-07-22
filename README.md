@@ -66,7 +66,7 @@ agente-corporativo/
 
 ```bash
 # 1. Clonar o repositório
-git clone https://github.com/OrlandoCaetano2026/agente-corporativo.git
+git clone https://github.com/OrlandoCaetano2026/Agente_corporativo.git
 cd agente-corporativo
 
 # 2. Instalar dependências
