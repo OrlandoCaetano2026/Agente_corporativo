@@ -2,19 +2,26 @@
 """
 rag_engine.py — PASSOS 4, 5 e 6: Indexação vetorial, recuperação (RAG) e geração
 --------------------------------------------------------------------------------
-Núcleo do agente (versão revisada — v3):
+Núcleo do agente (versão revisada — v4):
 
   PASSO 4 - Indexação vetorial: embeddings (HuggingFace all-MiniLM-L6-v2) + FAISS.
-  PASSO 5 - Recuperação: similaridade (para o limiar) + MMR (contexto diverso).
-  PASSO 6 - Geração: LLM Groq com prompt refinado + FEW-SHOTS (10 exemplos).
+  PASSO 5 - Recuperação: similaridade (limiar) + MMR (contexto diverso).
+  PASSO 6 - Geração: LLM Groq com prompt + FEW-SHOTS.
 
-Se o contexto NÃO for suficiente (baixa similaridade), o agente NÃO inventa:
-responde de forma SUCINTA e oferece registrar um chamado.
+REGRAS DE COMPORTAMENTO (v4):
+  - FILTRO DE DOMÍNIO: se a pergunta NÃO for sobre SAP/MES, o agente declina
+    educadamente e ENCERRA (não oferece chamado). Ex.: "clima de hoje".
+  - Se for do domínio SAP/MES e a base NÃO tiver a resposta, o agente oferece
+    registrar um chamado (uma única vez — o app conduz o fluxo).
+  - O LLM NUNCA oferece chamado por conta própria: quando não acha a resposta no
+    contexto, ele responde apenas com o marcador [SEM_RESPOSTA]. Quem decide
+    oferecer o chamado é o motor/aplicação (evita mensagens duplicadas).
 
 Portabilidade: Colab e OCI. Sem GROQ_API_KEY, roda em "modo recuperação".
 """
 from __future__ import annotations
 import os
+import re
 from typing import List, Tuple, Optional
 
 from document_loader import carregar_documentos, Chunk
@@ -28,16 +35,51 @@ LLM_TEMPERATURE = float(os.getenv("RAG_TEMPERATURE", "0.0"))
 LLM_MAX_TOKENS = int(os.getenv("RAG_MAX_TOKENS", "800"))
 # =====================================================
 
-# Mensagem de contorno cordial e SUCINTA (quando a base não tem a informação).
-MSG_SEM_RESPOSTA = (
-    "Isso não consta na base de conhecimento atual. Recomendo verificar o portal "
-    "da companhia. Posso registrar um chamado para um especialista validar — "
-    "deseja? Se sim, para qual ferramenta: SAP ou MES?"
+# ---- Mensagens padronizadas ----
+MSG_FORA_ESCOPO = (
+    "Sou um assistente especializado em SAP e MES, portanto não consigo ajudar "
+    "com esse assunto. Posso apoiar em dúvidas de SAP (MM, PP, QM, WM) ou nas "
+    "integrações MES (Opcenter/PAS-X)."
 )
+MSG_OFERECE_CHAMADO = (
+    "Não localizei essa informação na base de conhecimento. Deseja que eu registre "
+    "um chamado para um especialista? Se sim, informe a ferramenta: SAP ou MES "
+    "(ou responda 'não')."
+)
+SENTINELA_SEM_RESPOSTA = "[SEM_RESPOSTA]"
+
+# ============ FILTRO DE DOMÍNIO (SAP / MES) ============
+# Códigos e tcodes com fronteira de palavra (evita falsos positivos como "como" -> "co").
+_PADRAO_CODIGOS = re.compile(
+    r"\b(sap|mes|mm|pp|qm|wm|co|fi|sd|ecc|s/?4hana|s/?4|hana|fiori|abap|basis|"
+    r"opcenter|pas-?x|pasx|idoc|"
+    r"me\d{2}[a-z]?|co\d{2}[a-z]?|md\d{2}[a-z]?|mm\d{2}|qa\d{2}|lt\d{2}|"
+    r"migo|miro|mrbr|mmbe|mb52|bd87|we0\d|smq\d|li20|xk05)\b",
+    re.IGNORECASE,
+)
+# Palavras descritivas do domínio (substring é seguro por serem longas).
+_PALAVRAS_DOMINIO = [
+    "transação", "transacao", "tcode", "pedido de compra", "pedido", "compra",
+    "requisição", "requisicao", "fornecedor", "estoque", "material", "mestre",
+    "fatura", "nota fiscal", "ordem de produção", "ordem de producao", "mrp",
+    "lista técnica", "lista tecnica", "backflush", "inspeção", "inspecao",
+    "lote", "certificado", "qualidade", "depósito", "deposito", "transferência",
+    "transferencia", "picking", "inventário", "inventario", "consignação",
+    "consignacao", "subcontrat", "liberação", "liberacao", "estratégia",
+    "estrategia", "autorização", "autorizacao", "liberar acesso", "liberar meu acesso",
+    "movimento 101", "movimento 541", "registro info", "migração", "migracao",
+]
+
+
+def is_dominio_sap_mes(texto: str) -> bool:
+    """Retorna True se a pergunta tem relação com o ambiente SAP/MES."""
+    if _PADRAO_CODIGOS.search(texto or ""):
+        return True
+    t = (texto or "").lower()
+    return any(p in t for p in _PALAVRAS_DOMINIO)
+
 
 # ============ FEW-SHOTS (exemplos de orientação pergunta -> resposta) ============
-# Ensinam o modelo, PELO EXEMPLO, o tom, o formato e o comportamento esperados.
-# 8 casos de "SABE responder" (por área) + 2 casos de "NÃO SABE" (contorno sucinto).
 FEW_SHOTS = """# EXEMPLOS DE COMPORTAMENTO (siga este tom e formato)
 
 Exemplo 1 (MM — liberação de pedido):
@@ -104,13 +146,13 @@ Resposta:
 3. Abra um chamado com essas evidências para análise.
 (Fonte: Base de Conhecimento — SAP MM)
 
-Exemplo 9 (NÃO SABE — RH):
-Pergunta: Qual é a política de férias do RH?
-Resposta: Isso não consta na base de conhecimento. Posso registrar um chamado para um especialista? (SAP ou MES)
+Exemplo 9 (SAP, mas NÃO está na base — use o marcador):
+Pergunta: Preciso liberar meu acesso à transação KSKK do SAP CO.
+Resposta: [SEM_RESPOSTA]
 
-Exemplo 10 (NÃO SABE — Infraestrutura):
-Pergunta: Como faço o reset da senha da VPN?
-Resposta: Isso não consta na base de conhecimento. Posso registrar um chamado para um especialista? (SAP ou MES)
+Exemplo 10 (SAP, mas NÃO está na base — use o marcador):
+Pergunta: Como configurar o esquema de cálculo do módulo SAP CO?
+Resposta: [SEM_RESPOSTA]
 """
 
 
@@ -129,10 +171,8 @@ class RAGEngine:
         self.chunks = carregar_documentos(self.pasta)
         if not self.chunks:
             raise RuntimeError("Nenhum documento encontrado para indexar.")
-
         from langchain_community.vectorstores import FAISS
         from langchain_community.embeddings import HuggingFaceEmbeddings
-
         self._embeddings = HuggingFaceEmbeddings(model_name=self.modelo_embeddings)
         textos = [c.texto for c in self.chunks]
         metadados = [{"fonte": c.fonte, "tipo": c.tipo, **c.meta} for c in self.chunks]
@@ -141,7 +181,6 @@ class RAGEngine:
 
     # ---------- PASSO 5: recuperação ----------
     def recuperar(self, pergunta: str, k: int = TOP_K) -> List[Tuple[str, dict, float]]:
-        """Retorna [(texto, metadados, similaridade)] — usado para checar o limiar."""
         if self._vectorstore is None:
             raise RuntimeError("Índice não construído. Chame indexar() primeiro.")
         docs = self._vectorstore.similarity_search_with_score(pergunta, k=k)
@@ -152,7 +191,6 @@ class RAGEngine:
         return resultados
 
     def recuperar_mmr(self, pergunta: str):
-        """Recupera trechos diversificados (MMR) para montar o contexto da LLM."""
         return self._vectorstore.max_marginal_relevance_search(
             pergunta, k=TOP_K, fetch_k=FETCH_K, lambda_mult=MMR_LAMBDA)
 
@@ -177,35 +215,16 @@ direto e cordial — como um consultor experiente que respeita o tempo do colega
 # COMO INTERPRETAR O CONTEXTO
 - Leia TODO o contexto antes de responder e conecte informações de trechos diferentes.
 - Priorize dados objetivos (tcodes, movimentos, status, tabelas) sobre generalidades.
-- Se o contexto tiver a resposta apenas parcial, entregue o que há e sinalize o que falta.
 
-# COMO RESPONDER QUANDO SOUBER
-- Comece pela solução; evite rodeios e introduções longas.
-- Use passos numerados curtos (máximo ~6). Cite o TCODE sempre que aplicável
-  (ex.: ME29N, MIGO, MIRO, MRBR, CO11N, MD01N, QA32, LT01, BD87).
+# COMO RESPONDER QUANDO A RESPOSTA ESTÁ NO CONTEXTO
+- Comece pela solução; evite rodeios. Use passos numerados curtos (máximo ~6).
+- Cite o TCODE sempre que aplicável (ME29N, MIGO, MIRO, MRBR, CO11N, MD01N, QA32, LT01, BD87).
 - Não repita informação. Ao final, cite a fonte entre parênteses.
 
-# COMO RESPONDER QUANDO NÃO SOUBER (seja SUCINTO)
+# REGRA CRÍTICA — QUANDO A RESPOSTA NÃO ESTÁ NO CONTEXTO
 - NÃO invente e NÃO dê aula genérica sobre o tema.
-- Responda em no máximo 2 frases: informe que não está na base e ofereça o chamado.
-- Modelo: "Isso não consta na base de conhecimento. Posso registrar um chamado
-  para um especialista? (SAP ou MES)"
-
-# O QUE VOCÊ PODE RESPONDER (com base no contexto)
-- SAP MM: pedido/ME29N liberação, MIGO entrada/divergência, MIRO/MRBR fatura,
-  registro info, contrato, subcontratação (541/543), consignação (K), MM17 massa.
-- SAP PP: ordem CO11N, MRP MD01N/MD04, backflush, lista técnica (BOM/CS02), ATP.
-- SAP QM: lote de inspeção, tipo de inspeção, decisão de uso (QA32), certificado.
-- SAP WM: ordem de transferência LT01/LT12, picking, diferenças LI20, reabastecimento.
-- MES: replicação SAP↔Opcenter/PAS-X, IDoc status 51 (WE02/BD87), filas (SMQ1/SMQ2).
-- Diferenças ECC x S/4HANA e boas práticas presentes na base.
-
-# O QUE VOCÊ NÃO PODE RESPONDER (use o contorno sucinto)
-- RH, folha de pagamento, férias, benefícios.
-- Infraestrutura/TI: reset de senha, VPN, e-mail, rede.
-- Opiniões pessoais, previsões ou qualquer tema fora de SAP/MES.
-- Instruções para alterar dados diretamente em produção (isso exige chamado/aprovação).
-- Qualquer coisa que NÃO esteja embasada no contexto abaixo.
+- NÃO ofereça abrir chamado (isso é feito pelo sistema).
+- Responda EXCLUSIVAMENTE com o marcador, sem nenhuma outra palavra: {SENTINELA_SEM_RESPOSTA}
 
 {FEW_SHOTS}
 
@@ -222,20 +241,23 @@ RESPOSTA:"""
         """
         Retorna:
           {"tem_resposta": bool, "resposta": str,
-           "fontes": [ {fonte, tipo, score} ], "precisa_chamado": bool}
+           "fontes": [...], "precisa_chamado": bool, "fora_escopo": bool}
         """
+        # 1) FILTRO DE DOMÍNIO — se não é SAP/MES, declina e encerra (sem chamado).
+        if not is_dominio_sap_mes(pergunta):
+            return {"tem_resposta": False, "resposta": MSG_FORA_ESCOPO,
+                    "fontes": [], "precisa_chamado": False, "fora_escopo": True}
+
+        # 2) Recupera e checa o limiar
         recuperados = self.recuperar(pergunta)
         melhor_score = recuperados[0][2] if recuperados else 0.0
 
-        # Base sem embasamento suficiente -> não inventa, contorna de forma sucinta.
+        # Nada relevante na base -> oferece chamado (é do domínio SAP/MES)
         if melhor_score < LIMIAR_SIMILARIDADE:
-            return {
-                "tem_resposta": False,
-                "resposta": MSG_SEM_RESPOSTA,
-                "fontes": [],
-                "precisa_chamado": True,
-            }
+            return {"tem_resposta": False, "resposta": MSG_OFERECE_CHAMADO,
+                    "fontes": [], "precisa_chamado": True, "fora_escopo": False}
 
+        # 3) Tem contexto -> gera com a LLM
         docs_mmr = self.recuperar_mmr(pergunta)
         contexto = "\n\n".join(
             f"[Fonte: {d.metadata.get('fonte')} | tipo: {d.metadata.get('tipo')}]\n{d.page_content}"
@@ -248,13 +270,19 @@ RESPOSTA:"""
         if llm is None:
             resposta = ("[Modo recuperação — sem LLM configurada]\n\n"
                         "Trechos mais relevantes encontrados na base:\n\n" + contexto[:1500])
-            return {"tem_resposta": True, "resposta": resposta,
-                    "fontes": fontes, "precisa_chamado": False}
+            return {"tem_resposta": True, "resposta": resposta, "fontes": fontes,
+                    "precisa_chamado": False, "fora_escopo": False}
 
         prompt = self._montar_prompt(contexto, pergunta)
-        resposta = llm.invoke(prompt).content
-        return {"tem_resposta": True, "resposta": resposta,
-                "fontes": fontes, "precisa_chamado": False}
+        resposta = (llm.invoke(prompt).content or "").strip()
+
+        # LLM não encontrou no contexto -> oferece chamado (domínio SAP/MES)
+        if SENTINELA_SEM_RESPOSTA in resposta.upper() or resposta == "":
+            return {"tem_resposta": False, "resposta": MSG_OFERECE_CHAMADO,
+                    "fontes": [], "precisa_chamado": True, "fora_escopo": False}
+
+        return {"tem_resposta": True, "resposta": resposta, "fontes": fontes,
+                "precisa_chamado": False, "fora_escopo": False}
 
 
 if __name__ == "__main__":
@@ -263,11 +291,12 @@ if __name__ == "__main__":
     n = engine.indexar()
     print(f"Indexados {n} chunks.\n")
     for pergunta in [
-        "Como resolver o erro de estrategia de liberacao no pedido de compra?",
-        "Qual a politica de ferias do RH?",
+        "Como resolver o erro de estrategia de liberacao no pedido de compra?",  # sabe
+        "Preciso liberar meu acesso a transacao KSKK do SAP CO",                 # SAP, nao na base -> chamado
+        "Qual o clima de hoje?",                                                 # fora de escopo -> encerra
     ]:
         print("PERGUNTA:", pergunta)
         r = engine.responder(pergunta)
-        print("Tem resposta:", r["tem_resposta"], "| Precisa chamado:", r["precisa_chamado"])
-        print("Resposta:", r["resposta"][:300])
+        print(f"  fora_escopo={r['fora_escopo']} | precisa_chamado={r['precisa_chamado']}")
+        print("  Resposta:", r["resposta"][:160])
         print("-" * 70)
