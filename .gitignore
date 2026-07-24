@@ -22,3 +22,5 @@ log.txt
 # Sistema
 .DS_Store
 Thumbs.db
+streamlit.log
+fix_footer.py

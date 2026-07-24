@@ -190,5 +190,6 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption("Desenvolvido por Orlando Caetano")
-    st.markdown("[LinkedIn](https://www.linkedin.com/in/orlando-caetano/)  |  [Repositorio](https://github.com/OrlandoCaetano2026/Agente_corporativo")
+    st.markdown("<p style='font-size:15px;font-weight:700;margin:8px 0 8px'>Desenvolvido por Orlando Caetano</p>", unsafe_allow_html=True)
+    st.markdown("<p style='margin:4px 0'><a href='https://www.linkedin.com/in/orlando-caetano/' target='_blank' style='text-decoration:none;color:inherit'><img src='https://img.icons8.com/color/48/linkedin.png' width='16' style='vertical-align:middle;margin-right:8px'>Orlando Caetano</a></p>", unsafe_allow_html=True)
+    st.markdown("<p style='margin:4px 0'><a href='https://github.com/OrlandoCaetano2026/Agente_corporativo' target='_blank' style='text-decoration:none;color:inherit'><img src='https://cdn.simpleicons.org/github/FFFFFF' width='16' style='vertical-align:middle;margin-right:8px'>Repositorio do Projeto</a></p>", unsafe_allow_html=True)
