@@ -69,8 +69,9 @@ Agente_corporativo/
 │   └── main.py                       # Interface conversacional (Streamlit)
 ├── assets/
 │   └── orlatech_fluxo_suporte.png    # Imagem do fluxo (para o README)
-├── data/documentos/                  # Base de conhecimento (4 formatos)
+├── data/documentos/                  # Base de conhecimento (5 formatos)
 │   ├── Base_Conhecimento_FAQ_SAP.pdf
+│   ├── Catalogo_Transacoes_SAP.pdf
 │   ├── Chamados_Incidentes_Abertos.xlsx
 │   ├── Manual_Procedimentos_Suporte_SAP.docx
 │   └── orlatech_fluxo_suporte.png
@@ -84,6 +85,7 @@ Agente_corporativo/
 ├── .gitignore
 ├── DEPLOY_OCI.md                     # Guia de deploy no OCI (sem Docker)
 ├── README.md
+├── deploy.sh                         # Script de deploy (add+commit+push) no GitHub
 └── requirements.txt
 ```
 

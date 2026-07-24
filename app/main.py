@@ -188,3 +188,7 @@ with st.sidebar:
         st.session_state.mensagens = st.session_state.mensagens[:1]
         st.session_state.chamado = None
         st.rerun()
+
+    st.divider()
+    st.caption("Desenvolvido por Orlando Caetano")
+    st.markdown("[LinkedIn](https://www.linkedin.com/in/orlando-caetano/)  |  [Repositorio](https://github.com/OrlandoCaetano2026/Agente_corporativo")
