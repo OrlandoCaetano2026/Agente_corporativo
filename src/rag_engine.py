@@ -2,21 +2,17 @@
 """
 rag_engine.py — PASSOS 4, 5 e 6: Indexação vetorial, recuperação (RAG) e geração
 --------------------------------------------------------------------------------
-Núcleo do agente (versão revisada — v5):
+Núcleo do agente (versão revisada — v6):
 
   PASSO 4 - Indexação vetorial: embeddings (HuggingFace all-MiniLM-L6-v2) + FAISS.
   PASSO 5 - Recuperação: similaridade (limiar) + MMR (contexto diverso).
   PASSO 6 - Geração: LLM Groq com prompt refinado + 5 FEW-SHOTS.
 
-NOVIDADES v5:
-  - DETECÇÃO DE INTENÇÃO (entende o CONTEXTO, não só a palavra):
-      * "abertura"    -> usuário quer abrir chamado (o app conduz o fluxo)
-      * "informativa" -> "o que é / o que faz / para que serve"
-      * "problema"    -> "erro / não funciona / bloqueado"
-    Isso corrige o caso "O que é SAP?" que antes ia direto para chamado.
-  - Perguntas INFORMATIVAS sem resposta na base -> apenas INFORMA (sem oferecer chamado).
-  - Perguntas de PROBLEMA sem resposta na base -> oferece chamado.
-  - Base ampliada com o Catálogo de Transações (conceitos + tcodes).
+NOVIDADES v6:
+  - Fontes consultadas SEM duplicatas (dedupe por arquivo, mantém maior score).
+  - CONTINUAÇÃO de conversa herda o domínio SAP/MES e a intenção de PROBLEMA
+    (corrige "ainda não resolveu" caindo em fora de escopo / info sem chamado).
+  - Detecção de abertura mais robusta (aceita 'incident' sem o 'e').
 """
 from __future__ import annotations
 import os
@@ -40,12 +36,11 @@ MSG_FORA_ESCOPO = (
     "com esse assunto. Posso apoiar em dúvidas de SAP (MM, PP, QM, WM) ou nas "
     "integrações MES (Opcenter/PAS-X)."
 )
-# Perguntas de PROBLEMA sem resposta na base -> oferece chamado
+# Perguntas de PROBLEMA sem resposta na base -> encerra cordialmente (o app mostra botão)
 MSG_PROBLEMA_SEM_RESPOSTA = (
-    "Não tenho informações suficientes para responder essa pergunta com precisão. "
-    "Recomendo abrir um incidente para tratamento com um especialista do nosso time. "
-    "Deseja que eu registre o chamado? Se sim, informe a ferramenta: SAP ou MES "
-    "(ou responda 'não')."
+    "Espero ter ajudado a esclarecer o ponto. 🙏\n\n"
+    "Caso o problema **persista** ou precise de uma análise mais aprofundada, "
+    "posso registrar um incidente para o time responsável avaliar."
 )
 # Perguntas INFORMATIVAS sem resposta na base -> apenas informa (SEM chamado)
 MSG_INFO_SEM_RESPOSTA = (
@@ -55,12 +50,13 @@ MSG_INFO_SEM_RESPOSTA = (
 SENTINELA_SEM_RESPOSTA = "[SEM_RESPOSTA]"
 
 # ============ DETECÇÃO DE INTENÇÃO ============
-# Ordem importa: abertura > informativa > problema.
+# Ordem importa: abertura > informativa > problema > continuação.
 _GATILHOS_ABERTURA = [
     "abrir chamado", "abrir um chamado", "abrir incidente", "abrir um incidente",
+    "abrir incident", "abrir um incident", "abrir ticket", "abrir um ticket",
     "registrar chamado", "registrar um chamado", "registrar incidente",
-    "criar chamado", "criar um chamado", "criar incidente", "abrir ticket",
-    "quero um chamado", "preciso abrir um chamado", "abrir um ticket",
+    "criar chamado", "criar um chamado", "criar incidente", "criar incident",
+    "quero um chamado", "preciso abrir um chamado",
     "quero abrir", "gostaria de abrir",
 ]
 _GATILHOS_INFORMATIVA = [
@@ -75,16 +71,33 @@ _GATILHOS_PROBLEMA = [
     "nao gera", "não gera", "nao carrega", "não carrega", "problema", "parou",
     "nao esta", "não está", "divergencia", "divergência", "nao replica", "não replica",
 ]
+# Continuações de um problema anterior ("ainda não resolveu", "continua o erro"...).
+# Só valem quando há contexto anterior — evita falso positivo em pergunta isolada.
+_GATILHOS_CONTINUACAO = [
+    "ainda", "continua", "continuo", "persiste", "persistiu",
+    "nao resolveu", "não resolveu", "nao resolvi", "não resolvi",
+    "nao deu certo", "não deu certo", "mesmo assim", "mesmo apos", "mesmo após",
+    "sem sucesso", "sem resultado", "nao adiantou", "não adiantou",
+    "segue igual", "permanece", "nao funcionou", "não funcionou",
+    "nao consegui resolver", "não consegui resolver", "nao resolveram",
+]
 
 
-def classificar_intencao(texto: str) -> str:
-    """Retorna 'abertura' | 'informativa' | 'problema'."""
+def classificar_intencao(texto: str, contexto_anterior: str = "") -> str:
+    """Retorna 'abertura' | 'informativa' | 'problema'.
+
+    contexto_anterior: se houver uma pergunta anterior, frases de CONTINUAÇÃO
+    ("ainda não resolveu") são tratadas como 'problema', para oferecer chamado.
+    """
     t = (texto or "").lower()
     if any(g in t for g in _GATILHOS_ABERTURA):
         return "abertura"
     if any(g in t for g in _GATILHOS_INFORMATIVA):
         return "informativa"
     if any(g in t for g in _GATILHOS_PROBLEMA):
+        return "problema"
+    # Continuação de um problema já em andamento (precisa de contexto anterior)
+    if contexto_anterior and any(g in t for g in _GATILHOS_CONTINUACAO):
         return "problema"
     # Sem gatilho claro: trata como informativa (mais conservador — não força chamado)
     return "informativa"
@@ -254,7 +267,6 @@ RESPOSTA:"""
             atual = melhor_por_fonte.get(nome)
             if atual is None or f.get("score", 0) > atual.get("score", 0):
                 melhor_por_fonte[nome] = f
-        # Ordena por relevância (maior score primeiro)
         return sorted(melhor_por_fonte.values(),
                       key=lambda x: x.get("score", 0), reverse=True)
 
@@ -264,11 +276,11 @@ RESPOSTA:"""
           {"tem_resposta": bool, "resposta": str, "fontes": [...],
            "precisa_chamado": bool, "fora_escopo": bool, "intencao": str}
 
-        contexto_anterior: última mensagem do usuário na conversa. Usado para
-        que uma CONTINUAÇÃO (ex.: "ainda estou com problemas") herde o domínio
-        SAP/MES da pergunta anterior, evitando cair indevidamente em fora de escopo.
+        contexto_anterior: última mensagem do usuário na conversa. Usado para que
+        uma CONTINUAÇÃO ("ainda não resolveu") herde o domínio SAP/MES e a
+        intenção de PROBLEMA da pergunta anterior.
         """
-        intencao = classificar_intencao(pergunta)
+        intencao = classificar_intencao(pergunta, contexto_anterior)
 
         # 1) FILTRO DE DOMÍNIO — se não é SAP/MES, declina e encerra (sem chamado).
         #    Considera também o contexto anterior: se a conversa JÁ era SAP/MES,
@@ -279,8 +291,8 @@ RESPOSTA:"""
                     "precisa_chamado": False, "fora_escopo": True, "intencao": intencao}
 
         # 2) Recupera e checa o limiar.
-        #    Se houver contexto anterior, enriquece a busca (a continuação
-        #    sozinha — "ainda não resolveu" — tem pouca informação recuperável).
+        #    Se houver contexto anterior, enriquece a busca (a continuação sozinha
+        #    — "ainda não resolveu" — tem pouca informação recuperável).
         consulta = (contexto_anterior + " " + pergunta).strip() if contexto_anterior else pergunta
         recuperados = self.recuperar(consulta)
         melhor_score = recuperados[0][2] if recuperados else 0.0
@@ -338,11 +350,11 @@ if __name__ == "__main__":
     n = engine.indexar()
     print(f"Indexados {n} chunks.\n")
     testes = [
-        "O que é SAP?",                                  # informativa -> responde
-        "O que faz a transacao MM01?",                   # informativa -> responde
-        "Erro ao liberar pedido de compra na ME29N",     # problema -> responde/chamado
-        "Quero abrir um chamado",                        # abertura (app conduz)
-        "Qual o clima de hoje?",                         # fora de escopo
+        "O que é SAP?",
+        "O que faz a transacao MM01?",
+        "Erro ao liberar pedido de compra na ME29N",
+        "Quero abrir um chamado",
+        "Qual o clima de hoje?",
     ]
     for p in testes:
         r = engine.responder(p)

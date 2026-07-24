@@ -135,12 +135,6 @@ if pergunta := st.chat_input("Digite sua dúvida ou 'quero abrir um chamado'..."
             if r.get("precisa_chamado"):
                 descricao = (contexto_anterior + " " + pergunta).strip() if contexto_anterior else pergunta
                 st.session_state.chamado = {"etapa": "oferta", "descricao": descricao}
-                registrar(
-                    "Espero ter ajudado a esclarecer o ponto. 🙏\n\n"
-                    "Caso o problema **persista** ou precise de uma análise mais aprofundada, "
-                    "posso registrar um incidente para o time responsável avaliar. "
-                    "É só clicar no botão abaixo. 👇"
-                )
 
 
 # =========================================================
