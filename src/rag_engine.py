@@ -240,21 +240,49 @@ PERGUNTA: {pergunta}
 
 RESPOSTA:"""
 
-    def responder(self, pergunta: str) -> dict:
+    @staticmethod
+    def _dedupe_fontes(fontes: List[dict]) -> List[dict]:
+        """Remove fontes repetidas pelo nome do arquivo, mantendo o MAIOR score.
+
+        O mesmo documento é quebrado em vários chunks; sem isso, um único
+        arquivo (ex.: Chamados_Incidentes_Abertos.xlsx) apareceria várias vezes
+        no box 'Fontes consultadas'. Aqui consolidamos por nome de arquivo.
+        """
+        melhor_por_fonte: dict = {}
+        for f in fontes:
+            nome = f.get("fonte")
+            atual = melhor_por_fonte.get(nome)
+            if atual is None or f.get("score", 0) > atual.get("score", 0):
+                melhor_por_fonte[nome] = f
+        # Ordena por relevância (maior score primeiro)
+        return sorted(melhor_por_fonte.values(),
+                      key=lambda x: x.get("score", 0), reverse=True)
+
+    def responder(self, pergunta: str, contexto_anterior: str = "") -> dict:
         """
         Retorna:
           {"tem_resposta": bool, "resposta": str, "fontes": [...],
            "precisa_chamado": bool, "fora_escopo": bool, "intencao": str}
+
+        contexto_anterior: última mensagem do usuário na conversa. Usado para
+        que uma CONTINUAÇÃO (ex.: "ainda estou com problemas") herde o domínio
+        SAP/MES da pergunta anterior, evitando cair indevidamente em fora de escopo.
         """
         intencao = classificar_intencao(pergunta)
 
         # 1) FILTRO DE DOMÍNIO — se não é SAP/MES, declina e encerra (sem chamado).
-        if not is_dominio_sap_mes(pergunta):
+        #    Considera também o contexto anterior: se a conversa JÁ era SAP/MES,
+        #    a continuação herda o domínio (corrige o bug de "fora de escopo").
+        no_dominio = is_dominio_sap_mes(pergunta) or is_dominio_sap_mes(contexto_anterior)
+        if not no_dominio:
             return {"tem_resposta": False, "resposta": MSG_FORA_ESCOPO, "fontes": [],
                     "precisa_chamado": False, "fora_escopo": True, "intencao": intencao}
 
-        # 2) Recupera e checa o limiar
-        recuperados = self.recuperar(pergunta)
+        # 2) Recupera e checa o limiar.
+        #    Se houver contexto anterior, enriquece a busca (a continuação
+        #    sozinha — "ainda não resolveu" — tem pouca informação recuperável).
+        consulta = (contexto_anterior + " " + pergunta).strip() if contexto_anterior else pergunta
+        recuperados = self.recuperar(consulta)
         melhor_score = recuperados[0][2] if recuperados else 0.0
 
         if melhor_score < LIMIAR_SIMILARIDADE:
@@ -269,13 +297,15 @@ RESPOSTA:"""
                         "intencao": intencao}
 
         # 3) Tem contexto -> gera com a LLM
-        docs_mmr = self.recuperar_mmr(pergunta)
+        docs_mmr = self.recuperar_mmr(consulta)
         contexto = "\n\n".join(
             f"[Fonte: {d.metadata.get('fonte')} | tipo: {d.metadata.get('tipo')}]\n{d.page_content}"
             for d in docs_mmr
         )
         fontes = [{"fonte": m.get("fonte"), "tipo": m.get("tipo"), "score": round(s, 3)}
                   for _, m, s in recuperados]
+        # Consolida fontes repetidas (mesmo arquivo em vários chunks)
+        fontes = self._dedupe_fontes(fontes)
 
         llm = self._get_llm()
         if llm is None:

@@ -2,14 +2,20 @@
 """
 main.py — PASSO 7: Interface conversacional (Streamlit)
 -------------------------------------------------------
-Interface do Agente de Suporte SAP da Orla_Tech (v5).
+Interface do Agente de Suporte SAP da Orla_Tech (v6).
 
 Fluxos suportados:
   1) Pergunta INFORMATIVA ("o que é/faz X") -> responde; se não achar, só informa.
-  2) Pergunta de PROBLEMA ("erro/não funciona") -> responde; se não achar, oferece chamado.
-  3) Fora de SAP/MES -> declina educadamente e encerra (sem chamado).
-  4) ABERTURA DIRETA ("quero abrir um chamado") -> pede a descrição, detecta
-     ferramenta/módulo, pergunta a prioridade (P1-P4) e cria o chamado.
+  2) Pergunta de PROBLEMA ("erro/não funciona") -> responde; se não resolver,
+     encerra cordialmente e oferece o BOTÃO "Abrir incidente".
+  3) Fora de SAP/MES -> declina educadamente e encerra (sem botão/chamado).
+  4) ABERTURA DIRETA ("quero abrir um chamado") -> pede a descrição e segue
+     para a escolha de prioridade por BOTÕES (P1-P4).
+
+Novidades v6:
+  - Continuação de conversa herda o domínio SAP/MES (corrige "fora de escopo").
+  - Fontes consultadas sem duplicatas (dedupe no rag_engine).
+  - Abertura de incidente por BOTÃO + prioridade em 4 BOTÕES (P1-P4).
 
 Executar: streamlit run app/main.py
 """
@@ -48,132 +54,146 @@ if "mensagens" not in st.session_state:
                     "*\"quero abrir um chamado\"*."}
     ]
 # Estado do fluxo de chamado:
-#   None | {"etapa": "descricao"|"ferramenta"|"prioridade", "descricao": str, ...}
+#   None
+#   | {"etapa": "descricao"}                         -> abertura direta (aguarda descrição)
+#   | {"etapa": "oferta", "descricao": str}          -> problema sem solução (mostra botão)
+#   | {"etapa": "prioridade", "descricao","ferramenta","modulo","categoria"}
 if "chamado" not in st.session_state:
     st.session_state.chamado = None
+
+
+def _ultima_pergunta_usuario():
+    """Retorna a última mensagem do usuário (para dar contexto à continuação)."""
+    for m in reversed(st.session_state.mensagens):
+        if m["role"] == "user":
+            return m["content"]
+    return ""
+
 
 for m in st.session_state.mensagens:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
 
-def responder(texto):
+def registrar(texto):
+    """Exibe e guarda a mensagem do assistente no histórico."""
     st.markdown(texto)
     st.session_state.mensagens.append({"role": "assistant", "content": texto})
 
 
-def _nao(t): return t.strip().lower() in {"nao", "não", "n", "no", "cancela", "cancelar"}
-
-PRIOR_MAP = {
-    "1": "P1", "p1": "P1", "critico": "P1", "crítico": "P1",
-    "2": "P2", "p2": "P2", "urgente": "P2",
-    "3": "P3", "p3": "P3", "medio": "P3", "médio": "P3",
-    "4": "P4", "p4": "P4", "leve": "P4",
+PRIOR_LABEL = {
+    "P1": "🔴 P1 · Crítico", "P2": "🟠 P2 · Alto",
+    "P3": "🟡 P3 · Médio", "P4": "🟢 P4 · Leve",
 }
 
-def parse_prioridade(texto):
-    t = texto.strip().lower()
-    for chave, val in PRIOR_MAP.items():
-        if chave in t:
-            return val
-    return None
 
-
-def iniciar_prioridade(descricao):
-    """Detecta ferramenta/módulo e pede a prioridade."""
+def _preparar_prioridade(descricao):
+    """Detecta ferramenta/módulo e coloca o fluxo na etapa de prioridade."""
     info = analisar(descricao)
     st.session_state.chamado = {
         "etapa": "prioridade", "descricao": descricao,
         "ferramenta": info["ferramenta"], "modulo": info["modulo"],
         "categoria": info["categoria"],
     }
-    responder(
-        f"Entendido! Analisei a solicitação e identifiquei:\n"
-        f"- **Ferramenta:** {info['ferramenta']}\n"
-        f"- **Módulo:** {info['modulo']} ({info['categoria']})\n\n"
-        f"Qual a **prioridade** do incidente?\n"
-        f"- **P1** – Crítico (4h)\n- **P2** – Urgente (8h)\n"
-        f"- **P3** – Médio (16h)\n- **P4** – Leve (24h)"
-    )
 
 
+# =========================================================
+# ENTRADA DO USUÁRIO (chat)
+# =========================================================
 if pergunta := st.chat_input("Digite sua dúvida ou 'quero abrir um chamado'..."):
+    contexto_anterior = _ultima_pergunta_usuario()  # antes de anexar a atual
+
     st.session_state.mensagens.append({"role": "user", "content": pergunta})
     with st.chat_message("user"):
         st.markdown(pergunta)
 
-    c = st.session_state.chamado
-
     with st.chat_message("assistant"):
-        # ===== FLUXO DE CHAMADO EM ANDAMENTO =====
-        if c is not None:
-            if _nao(pergunta):
-                responder("Sem problemas, não abri nenhum chamado. Posso ajudar em algo mais? 😊")
-                st.session_state.chamado = None
+        # Abertura direta em andamento: a mensagem é a descrição do chamado
+        if st.session_state.chamado and st.session_state.chamado.get("etapa") == "descricao":
+            _preparar_prioridade(pergunta)
+            registrar("Perfeito! Já analisei a solicitação. "
+                      "Selecione abaixo a **prioridade** do incidente. 👇")
 
-            # Etapa: aguardando a DESCRIÇÃO do chamado (abertura direta)
-            elif c["etapa"] == "descricao":
-                iniciar_prioridade(pergunta)
+        # Usuário pediu explicitamente para abrir um chamado
+        elif classificar_intencao(pergunta) == "abertura":
+            st.session_state.chamado = {"etapa": "descricao"}
+            registrar("Claro! Descreva brevemente o **problema ou a solicitação** "
+                      "que deseja registrar no chamado.")
 
-            # Etapa: escolher a FERRAMENTA (vindo de um problema não resolvido)
-            elif c["etapa"] == "ferramenta":
-                txt = pergunta.strip().lower()
-                info = analisar(c["descricao"])
-                if "mes" in txt:
-                    ferramenta = "MES"
-                elif "sap" in txt:
-                    ferramenta = "SAP"
-                else:
-                    ferramenta = info["ferramenta"]
-                st.session_state.chamado.update({
-                    "etapa": "prioridade", "ferramenta": ferramenta,
-                    "modulo": info["modulo"], "categoria": info["categoria"],
-                })
-                responder(
-                    f"Ferramenta **{ferramenta}** · módulo **{info['modulo']}** "
-                    f"({info['categoria']}).\n\nQual a **prioridade**?\n"
-                    f"- **P1** – Crítico (4h)\n- **P2** – Urgente (8h)\n"
-                    f"- **P3** – Médio (16h)\n- **P4** – Leve (24h)"
+        # Pergunta normal -> RAG (com contexto da conversa anterior)
+        else:
+            with st.spinner("Consultando a base de conhecimento..."):
+                r = engine.responder(pergunta, contexto_anterior=contexto_anterior)
+            registrar(r["resposta"])
+
+            if r.get("fontes"):
+                with st.expander("📚 Fontes consultadas"):
+                    for f in r["fontes"]:
+                        st.write(f"- **{f['fonte']}** ({f['tipo']}) · relevância {f['score']}")
+
+            # Problema SAP/MES sem solução -> encerra cordialmente e oferece o botão
+            if r.get("precisa_chamado"):
+                descricao = (contexto_anterior + " " + pergunta).strip() if contexto_anterior else pergunta
+                st.session_state.chamado = {"etapa": "oferta", "descricao": descricao}
+                registrar(
+                    "Espero ter ajudado a esclarecer o ponto. 🙏\n\n"
+                    "Caso o problema **persista** ou precise de uma análise mais aprofundada, "
+                    "posso registrar um incidente para o time responsável avaliar. "
+                    "É só clicar no botão abaixo. 👇"
                 )
 
-            # Etapa: escolher a PRIORIDADE e CRIAR
-            elif c["etapa"] == "prioridade":
-                prio = parse_prioridade(pergunta)
-                if prio is None:
-                    responder("Não identifiquei a prioridade. Responda **P1**, **P2**, **P3** ou **P4** (ou 1-4).")
-                else:
-                    ticket = Ticket(
-                        descricao=c["descricao"], modulo=c["modulo"],
-                        ferramenta=c["ferramenta"], categoria=c["categoria"],
-                        prioridade=prio,
-                    )
-                    r = create_ticket(ticket, confirmado=True)
-                    responder("✅ " + r["mensagem"])
-                    st.session_state.chamado = None
 
-        # ===== SEM FLUXO ATIVO =====
-        else:
-            # O usuário quer ABRIR um chamado diretamente?
-            if classificar_intencao(pergunta) == "abertura":
-                st.session_state.chamado = {"etapa": "descricao"}
-                responder("Claro! Descreva brevemente o **problema ou a solicitação** "
-                          "que deseja registrar no chamado.")
-            else:
-                # Pergunta normal (RAG)
-                with st.spinner("Consultando a base de conhecimento..."):
-                    r = engine.responder(pergunta)
-                responder(r["resposta"])
+# =========================================================
+# ÁREA DE AÇÕES (botões) — renderizada sempre, sobrevive a reruns
+# =========================================================
+c = st.session_state.chamado
 
-                if r.get("fontes"):
-                    with st.expander("📚 Fontes consultadas"):
-                        for f in r["fontes"]:
-                            st.write(f"- **{f['fonte']}** ({f['tipo']}) · relevância {f['score']}")
+# --- Botão "Abrir incidente" (problema sem solução) ---
+if c and c.get("etapa") == "oferta":
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        if st.button("🎫 Abrir incidente", type="primary", use_container_width=True):
+            _preparar_prioridade(c["descricao"])
+            st.rerun()
+    with col_b:
+        if st.button("Não, obrigado", use_container_width=True):
+            st.session_state.chamado = None
+            st.session_state.mensagens.append(
+                {"role": "assistant",
+                 "content": "Sem problemas! Fico à disposição para outras dúvidas. 😊"})
+            st.rerun()
 
-                # Só inicia fluxo de chamado quando for PROBLEMA sem resposta
-                if r.get("precisa_chamado"):
-                    st.session_state.chamado = {"descricao": pergunta, "etapa": "ferramenta"}
+# --- Botões de PRIORIDADE (P1-P4) ---
+elif c and c.get("etapa") == "prioridade":
+    st.markdown(
+        f"**Incidente identificado** · Ferramenta: **{c['ferramenta']}** · "
+        f"Módulo: **{c['modulo']}** ({c['categoria']})"
+    )
+    st.caption("Selecione a prioridade (SLA): 🔴 P1 4h · 🟠 P2 8h · 🟡 P3 16h · 🟢 P4 24h")
+    cols = st.columns(4)
+    for i, prio in enumerate(["P1", "P2", "P3", "P4"]):
+        with cols[i]:
+            if st.button(PRIOR_LABEL[prio], key=f"prio_{prio}", use_container_width=True):
+                ticket = Ticket(
+                    descricao=c["descricao"], modulo=c["modulo"],
+                    ferramenta=c["ferramenta"], categoria=c["categoria"],
+                    prioridade=prio,
+                )
+                res = create_ticket(ticket, confirmado=True)
+                st.session_state.mensagens.append(
+                    {"role": "assistant", "content": "✅ " + res["mensagem"]})
+                st.session_state.chamado = None
+                st.rerun()
+    if st.button("Cancelar", key="prio_cancel"):
+        st.session_state.chamado = None
+        st.session_state.mensagens.append(
+            {"role": "assistant", "content": "Abertura de chamado cancelada. 😊"})
+        st.rerun()
 
 
+# =========================================================
+# SIDEBAR
+# =========================================================
 with st.sidebar:
     st.header("ℹ️ Sobre")
     st.write("Agente RAG **especialista SAP** da Orla_Tech Consultoria.")
@@ -188,3 +208,8 @@ with st.sidebar:
         st.session_state.mensagens = st.session_state.mensagens[:1]
         st.session_state.chamado = None
         st.rerun()
+
+    st.divider()
+    st.markdown("<p style='font-size:15px;font-weight:700;margin:8px 0 8px'>Desenvolvido por Orlando Caetano</p>", unsafe_allow_html=True)
+    st.markdown("<p style='margin:4px 0'><a href='https://www.linkedin.com/in/orlando-caetano/' target='_blank' style='text-decoration:none;color:inherit'><img src='https://img.icons8.com/color/48/linkedin.png' width='16' style='vertical-align:middle;margin-right:8px'>Orlando Caetano</a></p>", unsafe_allow_html=True)
+    st.markdown("<p style='margin:4px 0'><a href='https://github.com/OrlandoCaetano2026/Agente_corporativo' target='_blank' style='text-decoration:none;color:inherit'><img src='https://cdn.simpleicons.org/github/FFFFFF' width='16' style='vertical-align:middle;margin-right:8px'>Repositorio do Projeto</a></p>", unsafe_allow_html=True)
