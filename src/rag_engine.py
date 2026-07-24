@@ -2,22 +2,21 @@
 """
 rag_engine.py — PASSOS 4, 5 e 6: Indexação vetorial, recuperação (RAG) e geração
 --------------------------------------------------------------------------------
-Núcleo do agente (versão revisada — v4):
+Núcleo do agente (versão revisada — v5):
 
   PASSO 4 - Indexação vetorial: embeddings (HuggingFace all-MiniLM-L6-v2) + FAISS.
   PASSO 5 - Recuperação: similaridade (limiar) + MMR (contexto diverso).
-  PASSO 6 - Geração: LLM Groq com prompt + FEW-SHOTS.
+  PASSO 6 - Geração: LLM Groq com prompt refinado + 5 FEW-SHOTS.
 
-REGRAS DE COMPORTAMENTO (v4):
-  - FILTRO DE DOMÍNIO: se a pergunta NÃO for sobre SAP/MES, o agente declina
-    educadamente e ENCERRA (não oferece chamado). Ex.: "clima de hoje".
-  - Se for do domínio SAP/MES e a base NÃO tiver a resposta, o agente oferece
-    registrar um chamado (uma única vez — o app conduz o fluxo).
-  - O LLM NUNCA oferece chamado por conta própria: quando não acha a resposta no
-    contexto, ele responde apenas com o marcador [SEM_RESPOSTA]. Quem decide
-    oferecer o chamado é o motor/aplicação (evita mensagens duplicadas).
-
-Portabilidade: Colab e OCI. Sem GROQ_API_KEY, roda em "modo recuperação".
+NOVIDADES v5:
+  - DETECÇÃO DE INTENÇÃO (entende o CONTEXTO, não só a palavra):
+      * "abertura"    -> usuário quer abrir chamado (o app conduz o fluxo)
+      * "informativa" -> "o que é / o que faz / para que serve"
+      * "problema"    -> "erro / não funciona / bloqueado"
+    Isso corrige o caso "O que é SAP?" que antes ia direto para chamado.
+  - Perguntas INFORMATIVAS sem resposta na base -> apenas INFORMA (sem oferecer chamado).
+  - Perguntas de PROBLEMA sem resposta na base -> oferece chamado.
+  - Base ampliada com o Catálogo de Transações (conceitos + tcodes).
 """
 from __future__ import annotations
 import os
@@ -27,12 +26,12 @@ from typing import List, Tuple, Optional
 from document_loader import carregar_documentos, Chunk
 
 # ============ REGRAS DO RAG (ajuste aqui) ============
-LIMIAR_SIMILARIDADE = float(os.getenv("RAG_LIMIAR", "0.50"))
+LIMIAR_SIMILARIDADE = float(os.getenv("RAG_LIMIAR", "0.45"))
 TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 FETCH_K = int(os.getenv("RAG_FETCH_K", "12"))
 MMR_LAMBDA = float(os.getenv("RAG_MMR_LAMBDA", "0.5"))
 LLM_TEMPERATURE = float(os.getenv("RAG_TEMPERATURE", "0.0"))
-LLM_MAX_TOKENS = int(os.getenv("RAG_MAX_TOKENS", "800"))
+LLM_MAX_TOKENS = int(os.getenv("RAG_MAX_TOKENS", "700"))
 # =====================================================
 
 # ---- Mensagens padronizadas ----
@@ -41,23 +40,66 @@ MSG_FORA_ESCOPO = (
     "com esse assunto. Posso apoiar em dúvidas de SAP (MM, PP, QM, WM) ou nas "
     "integrações MES (Opcenter/PAS-X)."
 )
-MSG_OFERECE_CHAMADO = (
-    "Não localizei essa informação na base de conhecimento. Deseja que eu registre "
-    "um chamado para um especialista? Se sim, informe a ferramenta: SAP ou MES "
+# Perguntas de PROBLEMA sem resposta na base -> oferece chamado
+MSG_PROBLEMA_SEM_RESPOSTA = (
+    "Não tenho informações suficientes para responder essa pergunta com precisão. "
+    "Recomendo abrir um incidente para tratamento com um especialista do nosso time. "
+    "Deseja que eu registre o chamado? Se sim, informe a ferramenta: SAP ou MES "
     "(ou responda 'não')."
+)
+# Perguntas INFORMATIVAS sem resposta na base -> apenas informa (SEM chamado)
+MSG_INFO_SEM_RESPOSTA = (
+    "Não tenho informações suficientes na base de conhecimento para responder essa "
+    "pergunta com precisão. Sugiro consultar a documentação no portal da companhia."
 )
 SENTINELA_SEM_RESPOSTA = "[SEM_RESPOSTA]"
 
+# ============ DETECÇÃO DE INTENÇÃO ============
+# Ordem importa: abertura > informativa > problema.
+_GATILHOS_ABERTURA = [
+    "abrir chamado", "abrir um chamado", "abrir incidente", "abrir um incidente",
+    "registrar chamado", "registrar um chamado", "registrar incidente",
+    "criar chamado", "criar um chamado", "criar incidente", "abrir ticket",
+    "quero um chamado", "preciso abrir um chamado", "abrir um ticket",
+    "quero abrir", "gostaria de abrir",
+]
+_GATILHOS_INFORMATIVA = [
+    "o que e", "o que é", "o que faz", "o que significa", "para que serve",
+    "para que sirve", "como funciona", "qual a funcao", "qual a função",
+    "qual a finalidade", "defina", "definicao", "definição", "explique",
+    "significa", "serve para", "pra que serve", "qual o objetivo",
+]
+_GATILHOS_PROBLEMA = [
+    "erro", "nao funciona", "não funciona", "bloqueado", "bloqueada", "nao consigo",
+    "não consigo", "falha", "travou", "travado", "nao aparece", "não aparece",
+    "nao gera", "não gera", "nao carrega", "não carrega", "problema", "parou",
+    "nao esta", "não está", "divergencia", "divergência", "nao replica", "não replica",
+]
+
+
+def classificar_intencao(texto: str) -> str:
+    """Retorna 'abertura' | 'informativa' | 'problema'."""
+    t = (texto or "").lower()
+    if any(g in t for g in _GATILHOS_ABERTURA):
+        return "abertura"
+    if any(g in t for g in _GATILHOS_INFORMATIVA):
+        return "informativa"
+    if any(g in t for g in _GATILHOS_PROBLEMA):
+        return "problema"
+    # Sem gatilho claro: trata como informativa (mais conservador — não força chamado)
+    return "informativa"
+
+
 # ============ FILTRO DE DOMÍNIO (SAP / MES) ============
-# Códigos e tcodes com fronteira de palavra (evita falsos positivos como "como" -> "co").
 _PADRAO_CODIGOS = re.compile(
     r"\b(sap|mes|mm|pp|qm|wm|co|fi|sd|ecc|s/?4hana|s/?4|hana|fiori|abap|basis|"
-    r"opcenter|pas-?x|pasx|idoc|"
-    r"me\d{2}[a-z]?|co\d{2}[a-z]?|md\d{2}[a-z]?|mm\d{2}|qa\d{2}|lt\d{2}|"
+    r"opcenter|pas-?x|pasx|idoc|erp|tcode|"
+    r"me\d{2}[a-z]?|co\d{2}[a-z]?|md\d{2}[a-z]?|mm\d{2}|qa\d{2}|qe\d{2}|qp\d{2}|"
+    r"qs\d{2}|qc\d{2}|qm\d{2}|lt\d{2}|ls\d{2}|lx\d{2}|lb\d{2}|cs\d{2}|ca\d{2}|"
+    r"cr\d{2}|mb\d[a-z0-9]?|mi\d{2}|mk\d{2}|xk\d{2}|"
     r"migo|miro|mrbr|mmbe|mb52|bd87|we0\d|smq\d|li20|xk05)\b",
     re.IGNORECASE,
 )
-# Palavras descritivas do domínio (substring é seguro por serem longas).
 _PALAVRAS_DOMINIO = [
     "transação", "transacao", "tcode", "pedido de compra", "pedido", "compra",
     "requisição", "requisicao", "fornecedor", "estoque", "material", "mestre",
@@ -68,6 +110,7 @@ _PALAVRAS_DOMINIO = [
     "consignacao", "subcontrat", "liberação", "liberacao", "estratégia",
     "estrategia", "autorização", "autorizacao", "liberar acesso", "liberar meu acesso",
     "movimento 101", "movimento 541", "registro info", "migração", "migracao",
+    "modulo", "módulo",
 ]
 
 
@@ -79,58 +122,29 @@ def is_dominio_sap_mes(texto: str) -> bool:
     return any(p in t for p in _PALAVRAS_DOMINIO)
 
 
-# ============ FEW-SHOTS (exemplos de orientação pergunta -> resposta) ============
+# ============ FEW-SHOTS (5 exemplos de orientação) ============
 FEW_SHOTS = """# EXEMPLOS DE COMPORTAMENTO (siga este tom e formato)
 
-Exemplo 1 (MM — liberação de pedido):
-Pergunta: Recebo "estratégia de liberação não encontrada" ao liberar um pedido.
-Resposta:
-1. Confira grupo de compras, tipo de documento e valor total do pedido (ME23N).
-2. Valide se a característica de classificação corresponde a uma estratégia ativa.
-3. Verifique se o pedido não está abaixo do valor mínimo que exige liberação.
-Execute a liberação em ME29N após o ajuste. (Fonte: Base de Conhecimento — SAP MM)
+Exemplo 1 (Informativa — conceito):
+Pergunta: O que é o módulo MM?
+Resposta: O MM (Materials Management) é o módulo do SAP para gestão de materiais:
+compras, pedidos, entrada de mercadoria, estoques, faturas e mestre de materiais.
+(Fonte: Catálogo de Transações SAP)
 
-Exemplo 2 (MM — fatura bloqueada):
+Exemplo 2 (Informativa — transação):
+Pergunta: O que faz a transação MM01?
+Resposta: A transação MM01 é utilizada para criar o mestre de material no SAP.
+(Fonte: Catálogo de Transações SAP)
+
+Exemplo 3 (Problema — MM):
 Pergunta: A fatura foi bloqueada no MIRO por diferença de preço, o que faço?
 Resposta:
-1. Compare o preço do pedido com o da fatura; cheque o registro info.
-2. Se for erro de preço no pedido, corrija e reprocesse.
-3. Se o preço da fatura estiver correto, libere manualmente em MRBR com justificativa.
+1. Compare o preço do pedido com o da fatura e confira o registro info.
+2. Se o preço do pedido estiver desatualizado, corrija e reprocesse.
+3. Se a fatura estiver correta, libere manualmente em MRBR com justificativa.
 (Fonte: Base de Conhecimento — SAP MM)
 
-Exemplo 3 (MM — subcontratação):
-Pergunta: Como funciona a subcontratação?
-Resposta:
-1. No pedido de subcontratação (item categoria L), o componente é enviado ao fornecedor (mov. 541).
-2. No recebimento do beneficiado, o mov. 543 baixa os componentes automaticamente.
-3. Acompanhe o estoque em poder de terceiros (estoque especial O) via MMBE.
-(Fonte: Base de Conhecimento — SAP MM)
-
-Exemplo 4 (PP — ordem não confirma):
-Pergunta: A ordem de produção não confirma no CO11N.
-Resposta:
-1. Verifique a disponibilidade dos componentes e o status da ordem.
-2. Confirme se a operação anterior já foi confirmada (sequenciamento).
-3. Cheque se o centro de trabalho está ativo.
-(Fonte: Base de Conhecimento — SAP PP)
-
-Exemplo 5 (QM — lote de inspeção):
-Pergunta: O lote de inspeção não é gerado na entrada de mercadoria.
-Resposta:
-1. Confirme o perfil de QM ativo no mestre do material (aba Qualidade).
-2. Verifique se o tipo de inspeção correto (ex.: 01 para recebimento) está atribuído.
-3. Sem tipo de inspeção ativo, o lote não é disparado — ative e teste novamente (QA32).
-(Fonte: Base de Conhecimento — SAP QM)
-
-Exemplo 6 (WM — ordem de transferência):
-Pergunta: A LT01 não determina o depósito de destino.
-Resposta:
-1. Revise a estratégia de colocação/retirada e os tipos de depósito configurados.
-2. Verifique se há posições bloqueadas ou sem capacidade.
-3. Ajuste a estratégia e recrie a ordem de transferência (LT01).
-(Fonte: Base de Conhecimento — SAP WM)
-
-Exemplo 7 (MES — IDoc status 51):
+Exemplo 4 (Problema — MES):
 Pergunta: A ordem não replica para o Opcenter, IDoc em status 51.
 Resposta:
 1. Abra o IDoc em WE02/WE19 e leia a mensagem de erro de aplicação.
@@ -138,20 +152,8 @@ Resposta:
 3. Reprocesse o IDoc em BD87.
 (Fonte: Base de Conhecimento — Integração/MES)
 
-Exemplo 8 (ECC x S/4 — diferença de dados):
-Pergunta: Após migrar para o S/4HANA, notei divergência no mestre de material.
-Resposta:
-1. Diferenças de layout são esperadas (ex.: material com até 40 caracteres, MATDOC).
-2. Divergência de VALORES não é esperada — registre material, campo e valores ECC x S/4.
-3. Abra um chamado com essas evidências para análise.
-(Fonte: Base de Conhecimento — SAP MM)
-
-Exemplo 9 (SAP, mas NÃO está na base — use o marcador):
-Pergunta: Preciso liberar meu acesso à transação KSKK do SAP CO.
-Resposta: [SEM_RESPOSTA]
-
-Exemplo 10 (SAP, mas NÃO está na base — use o marcador):
-Pergunta: Como configurar o esquema de cálculo do módulo SAP CO?
+Exemplo 5 (Não há conteúdo suficiente no contexto):
+Pergunta: Qual o procedimento interno para configurar o esquema Z de preço?
 Resposta: [SEM_RESPOSTA]
 """
 
@@ -215,16 +217,17 @@ direto e cordial — como um consultor experiente que respeita o tempo do colega
 # COMO INTERPRETAR O CONTEXTO
 - Leia TODO o contexto antes de responder e conecte informações de trechos diferentes.
 - Priorize dados objetivos (tcodes, movimentos, status, tabelas) sobre generalidades.
+- Para perguntas conceituais ("o que é", "o que faz"), responda de forma curta e clara.
 
 # COMO RESPONDER QUANDO A RESPOSTA ESTÁ NO CONTEXTO
-- Comece pela solução; evite rodeios. Use passos numerados curtos (máximo ~6).
-- Cite o TCODE sempre que aplicável (ME29N, MIGO, MIRO, MRBR, CO11N, MD01N, QA32, LT01, BD87).
+- Comece pela solução; evite rodeios. Use passos numerados curtos quando for um problema.
+- Cite o TCODE sempre que aplicável (ME29N, MIGO, MIRO, MRBR, CO11N, MD01N, QA32, LT01).
 - Não repita informação. Ao final, cite a fonte entre parênteses.
 
 # REGRA CRÍTICA — QUANDO A RESPOSTA NÃO ESTÁ NO CONTEXTO
-- NÃO invente e NÃO dê aula genérica sobre o tema.
+- NÃO invente e NÃO dê aula genérica.
 - NÃO ofereça abrir chamado (isso é feito pelo sistema).
-- Responda EXCLUSIVAMENTE com o marcador, sem nenhuma outra palavra: {SENTINELA_SEM_RESPOSTA}
+- Responda EXCLUSIVAMENTE com o marcador, sem mais nada: {SENTINELA_SEM_RESPOSTA}
 
 {FEW_SHOTS}
 
@@ -240,22 +243,30 @@ RESPOSTA:"""
     def responder(self, pergunta: str) -> dict:
         """
         Retorna:
-          {"tem_resposta": bool, "resposta": str,
-           "fontes": [...], "precisa_chamado": bool, "fora_escopo": bool}
+          {"tem_resposta": bool, "resposta": str, "fontes": [...],
+           "precisa_chamado": bool, "fora_escopo": bool, "intencao": str}
         """
+        intencao = classificar_intencao(pergunta)
+
         # 1) FILTRO DE DOMÍNIO — se não é SAP/MES, declina e encerra (sem chamado).
         if not is_dominio_sap_mes(pergunta):
-            return {"tem_resposta": False, "resposta": MSG_FORA_ESCOPO,
-                    "fontes": [], "precisa_chamado": False, "fora_escopo": True}
+            return {"tem_resposta": False, "resposta": MSG_FORA_ESCOPO, "fontes": [],
+                    "precisa_chamado": False, "fora_escopo": True, "intencao": intencao}
 
         # 2) Recupera e checa o limiar
         recuperados = self.recuperar(pergunta)
         melhor_score = recuperados[0][2] if recuperados else 0.0
 
-        # Nada relevante na base -> oferece chamado (é do domínio SAP/MES)
         if melhor_score < LIMIAR_SIMILARIDADE:
-            return {"tem_resposta": False, "resposta": MSG_OFERECE_CHAMADO,
-                    "fontes": [], "precisa_chamado": True, "fora_escopo": False}
+            # Sem base: o comportamento depende da INTENÇÃO
+            if intencao == "problema":
+                return {"tem_resposta": False, "resposta": MSG_PROBLEMA_SEM_RESPOSTA,
+                        "fontes": [], "precisa_chamado": True, "fora_escopo": False,
+                        "intencao": intencao}
+            else:  # informativa
+                return {"tem_resposta": False, "resposta": MSG_INFO_SEM_RESPOSTA,
+                        "fontes": [], "precisa_chamado": False, "fora_escopo": False,
+                        "intencao": intencao}
 
         # 3) Tem contexto -> gera com a LLM
         docs_mmr = self.recuperar_mmr(pergunta)
@@ -271,18 +282,24 @@ RESPOSTA:"""
             resposta = ("[Modo recuperação — sem LLM configurada]\n\n"
                         "Trechos mais relevantes encontrados na base:\n\n" + contexto[:1500])
             return {"tem_resposta": True, "resposta": resposta, "fontes": fontes,
-                    "precisa_chamado": False, "fora_escopo": False}
+                    "precisa_chamado": False, "fora_escopo": False, "intencao": intencao}
 
         prompt = self._montar_prompt(contexto, pergunta)
         resposta = (llm.invoke(prompt).content or "").strip()
 
-        # LLM não encontrou no contexto -> oferece chamado (domínio SAP/MES)
+        # LLM não encontrou no contexto -> depende da intenção
         if SENTINELA_SEM_RESPOSTA in resposta.upper() or resposta == "":
-            return {"tem_resposta": False, "resposta": MSG_OFERECE_CHAMADO,
-                    "fontes": [], "precisa_chamado": True, "fora_escopo": False}
+            if intencao == "problema":
+                return {"tem_resposta": False, "resposta": MSG_PROBLEMA_SEM_RESPOSTA,
+                        "fontes": [], "precisa_chamado": True, "fora_escopo": False,
+                        "intencao": intencao}
+            else:
+                return {"tem_resposta": False, "resposta": MSG_INFO_SEM_RESPOSTA,
+                        "fontes": [], "precisa_chamado": False, "fora_escopo": False,
+                        "intencao": intencao}
 
         return {"tem_resposta": True, "resposta": resposta, "fontes": fontes,
-                "precisa_chamado": False, "fora_escopo": False}
+                "precisa_chamado": False, "fora_escopo": False, "intencao": intencao}
 
 
 if __name__ == "__main__":
@@ -290,13 +307,16 @@ if __name__ == "__main__":
     engine = RAGEngine(base)
     n = engine.indexar()
     print(f"Indexados {n} chunks.\n")
-    for pergunta in [
-        "Como resolver o erro de estrategia de liberacao no pedido de compra?",  # sabe
-        "Preciso liberar meu acesso a transacao KSKK do SAP CO",                 # SAP, nao na base -> chamado
-        "Qual o clima de hoje?",                                                 # fora de escopo -> encerra
-    ]:
-        print("PERGUNTA:", pergunta)
-        r = engine.responder(pergunta)
-        print(f"  fora_escopo={r['fora_escopo']} | precisa_chamado={r['precisa_chamado']}")
-        print("  Resposta:", r["resposta"][:160])
-        print("-" * 70)
+    testes = [
+        "O que é SAP?",                                  # informativa -> responde
+        "O que faz a transacao MM01?",                   # informativa -> responde
+        "Erro ao liberar pedido de compra na ME29N",     # problema -> responde/chamado
+        "Quero abrir um chamado",                        # abertura (app conduz)
+        "Qual o clima de hoje?",                         # fora de escopo
+    ]
+    for p in testes:
+        r = engine.responder(p)
+        print("P:", p)
+        print(f"  intencao={r['intencao']} | fora_escopo={r['fora_escopo']} | precisa_chamado={r['precisa_chamado']}")
+        print("  R:", r["resposta"][:120])
+        print("-"*70)
